@@ -53,6 +53,8 @@ st.markdown(
         font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
     }
     #MainMenu, footer, header { visibility: hidden; }
+    [data-testid="collapsedControl"] { visibility: visible !important; }
+
 
     /* ── Sidebar ── */
     section[data-testid="stSidebar"] {
