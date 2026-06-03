@@ -827,6 +827,131 @@ Example JSON output format:
         pass
 
     return get_fallback_insights()
+
+
+# ──────────────────────────────────────────────
+# Data Analysis helper
+# ──────────────────────────────────────────────
+def answer_data_query(query: str, df: pd.DataFrame) -> dict:
+    """
+    Use LLM to generate pandas code for a data query, execute it on `df`, and summarize the results.
+    """
+    if client is None:
+        return {"error": "LLM client not configured. Cannot perform data analysis."}
+    
+    # 1. Generate code
+    prompt_code = f"""
+You are an expert pandas programmer. Write pandas code to answer this user question about a sales dataset.
+
+The dataset is loaded in a pandas DataFrame named `df`.
+`df` has the following columns:
+- `date`: datetime64[ns]
+- `store`: int64 (ranges from 1 to 10)
+- `item`: int64 (ranges from 1 to 50)
+- `sales`: int64 (daily sales volume)
+
+User question: "{query}"
+
+Rules:
+- Write ONLY a single expression or a small block of pandas code.
+- Save the final result into a variable named `result`.
+- Keep the result small (e.g., use `.head(10)`, `.sum()`, `.mean()`, or group/aggregate) so it can be converted to markdown and summarized.
+- Do NOT import other libraries unless necessary (like numpy, datetime).
+- Return ONLY a JSON object with two keys: "explanation" (what the query does) and "code" (the python code to execute). Do not use markdown code fences.
+- If the question is completely unrelated to the sales dataset (e.g. general knowledge, greetings, math), return a JSON object with the "error" key explaining that the question is unrelated, and an empty code string.
+
+Example JSON output:
+{{
+  "explanation": "Group sales by month and sum them to find the highest-selling months.",
+  "code": "result = df.groupby(df['date'].dt.strftime('%B'))['sales'].sum().reset_index().sort_values('sales', ascending=False)"
+}}
+"""
+
+    try:
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": "You write pandas code to query a sales dataframe and return JSON only."},
+                {"role": "user", "content": prompt_code},
+            ]
+        )
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.replace("```json", "").replace("```", "").strip()
+        
+        parsed = json.loads(raw)
+        if "error" in parsed:
+            return {"error": parsed["error"]}
+            
+        code = parsed["code"]
+        explanation = parsed["explanation"]
+    except Exception as e:
+        return {"error": f"Failed to generate query code: {str(e)}"}
+
+    # 2. Execute code
+    try:
+        # Prepare context for execution
+        local_vars = {"df": df, "pd": pd, "np": np}
+        exec(code, {}, local_vars)
+        result = local_vars.get("result")
+    except Exception as e:
+        return {
+            "error": f"Failed to execute generated query code:\n{code}\nError: {str(e)}",
+            "code": code,
+            "explanation": explanation
+        }
+
+    # 3. Format result
+    # Convert result to string or markdown
+    if isinstance(result, pd.DataFrame):
+        result_str = result.to_markdown(index=False)
+    elif isinstance(result, pd.Series):
+        result_str = result.to_markdown()
+    else:
+        result_str = str(result)
+
+    prompt_summary = f"""
+You are a retail data analyst. A user asked this question:
+"{query}"
+
+To answer this, we executed the following pandas query:
+`{code}`
+
+The query returned the following results:
+{result_str}
+
+Write a professional, clear, and user-friendly answer summarizing these results. Use bullet points or formatted text where appropriate. Highlight key insights using **bold** text. Keep it concise.
+"""
+    try:
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            temperature=0.2,
+            messages=[
+                {"role": "system", "content": "You are a professional retail data analyst summarizing query results."},
+                {"role": "user", "content": prompt_summary},
+            ]
+        )
+        summary = response.choices[0].message.content.strip()
+        return {
+            "success": True,
+            "explanation": explanation,
+            "code": code,
+            "result_obj": result,
+            "result_raw": result_str,
+            "summary": summary
+        }
+    except Exception as e:
+        return {
+            "success": True,
+            "explanation": explanation,
+            "code": code,
+            "result_obj": result,
+            "result_raw": result_str,
+            "summary": f"Query ran successfully, but could not generate summary: {str(e)}"
+        }
+
+
 # ──────────────────────────────────────────────
 # Plotly chart helper
 # ──────────────────────────────────────────────
@@ -984,9 +1109,10 @@ st.markdown("---")
 
 
 # ──────────────────────────────────────────────
-# Process forecast
+# Process forecast / analysis
 # ──────────────────────────────────────────────
 result = None
+analysis_result = None
 display_store = None
 display_item = None
 display_date = None
@@ -1026,10 +1152,8 @@ elif mode == "AI Assistant" and run_ai:
                 with st.spinner("Predicting…"):
                     result = forecast(display_store, display_item, display_date)
         else:
-            st.warning(
-                "Couldn't parse your request. Try something like:\n\n"
-                "> *Predict sales for Store 10 Item 5 on 2018-01-31*"
-            )
+            with st.spinner("Analyzing dataset…"):
+                analysis_result = answer_data_query(nl_input, data)
     else:
         st.warning("Enter a forecast request above.")
 
@@ -1129,6 +1253,43 @@ if result is not None:
         # ── Feature table ──
         with st.expander("View model input features"):
             st.dataframe(feats, use_container_width=True, hide_index=True)
+
+elif analysis_result is not None:
+    if "error" in analysis_result:
+        st.error(analysis_result["error"])
+        st.info("Try asking about historical sales trends, top-selling items, best performing stores, or seasonal patterns (e.g., 'which months has the highest sales?').")
+    else:
+        explanation = analysis_result["explanation"]
+        code = analysis_result["code"]
+        summary = analysis_result["summary"]
+        raw_obj = analysis_result.get("result_obj")
+        
+        st.markdown(
+            f"""
+            <div class="insights-card" style="margin-top: 0;">
+                <div class="insights-header">
+                    <div class="insights-icon" style="background: rgba(139, 92, 246, 0.1); border-color: rgba(139, 92, 246, 0.15);">📊</div>
+                    <div>
+                        <div class="insights-label">Data Analysis Result</div>
+                        <div class="insights-sublabel">{explanation}</div>
+                    </div>
+                </div>
+                <div style="color: #EDEDEF; font-size: 14px; line-height: 1.6; margin-top: 10px;">
+                    {summary}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        
+        if isinstance(raw_obj, (pd.DataFrame, pd.Series)):
+            st.markdown('<div class="chart-wrap" style="margin-top: 20px;">', unsafe_allow_html=True)
+            st.markdown('<div class="chart-title">Data Table</div>', unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+            st.dataframe(raw_obj, use_container_width=True)
+            
+        with st.expander("View generated pandas query"):
+            st.code(code, language="python")
 
 else:
     # ── Empty state ──
