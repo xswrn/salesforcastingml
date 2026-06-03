@@ -1,0 +1,5 @@
+.env
+LLM_API_KEY=gsk_vieNbLdVIn7vi4SHdda.env
+__pycache__/
+*.pyc
+.streamlit/config.toml

@@ -8,9 +8,26 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from catboost import CatBoostRegressor
-from datetime import datetime, timedelta
-import json
+from datetime import datetime, date, timedelta
 import re
+
+import os
+import json
+from dotenv import load_dotenv
+from openai import OpenAI
+
+load_dotenv()
+
+api_key = os.getenv("LLM_API_KEY")
+if api_key:
+    client = OpenAI(
+        api_key=api_key,
+        base_url=os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1"),
+    )
+else:
+    client = None
+
+LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
 
 # ──────────────────────────────────────────────
 # Page config
@@ -534,27 +551,123 @@ def forecast(store_id: int, item_id: int, target_date: datetime) -> dict:
 
 
 # ──────────────────────────────────────────────
-# LLM integration stub — UI only
+# LLM integration
 # ──────────────────────────────────────────────
+def parse_forecast_intent(
+    message: str,
+    available_stores: list[int],
+    available_items: list[int],
+    last_known_date: date,
+) -> dict | None:
+    """
+    Use the LLM to extract forecast parameters from a natural-language message.
+
+    Returns:
+        {"store_id": int, "item_id": int, "target_date": "YYYY-MM-DD"}
+        or None if extraction fails.
+    """
+    if client is None:
+        return None
+    llm_prompt = f"""
+You extract sales forecast parameters from a user message.
+
+Return ONLY valid JSON.
+
+Valid store IDs:
+{available_stores}
+
+Valid item IDs:
+{available_items}
+
+Latest available training date:
+{last_known_date.isoformat()}
+
+If the user is NOT asking for a forecast, return:
+{{"intent": null}}
+
+If the user IS asking for a forecast, return:
+{{
+  "intent": "forecast",
+  "store_id": 1,
+  "item_id": 1,
+  "target_date": "YYYY-MM-DD"
+}}
+
+Rules:
+- Use only JSON.
+- No markdown.
+- No explanation text.
+- target_date must be ISO format.
+- If the date is relative like "tomorrow" or "next week", resolve it to an absolute date.
+- Prefer values that exist in the provided store/item lists.
+- If you cannot confidently extract all fields, return {{"intent": null}}.
+
+User message:
+{message}
+"""
+
+    try:
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": "Extract forecast intent and return JSON only."},
+                {"role": "user", "content": llm_prompt},
+            ],
+        )
+
+        raw = response.choices[0].message.content.strip()
+
+        # Strip accidental code fences
+        if raw.startswith("```"):
+            raw = raw.replace("```json", "").replace("```", "").strip()
+
+        data = json.loads(raw)
+
+    except Exception:
+        return None
+
+    if data.get("intent") is None:
+        return None
+
+    try:
+        return {
+            "store_id": int(data["store_id"]),
+            "item_id": int(data["item_id"]),
+            "target_date": data["target_date"],
+        }
+    except Exception:
+        return None
+
+
 def parse_natural_language(prompt: str) -> dict | None:
     """
-    PLACEHOLDER — replace the body of this function with your LLM API call.
+    Parse a natural-language forecast request.
+    Tries the LLM first, falls back to regex.
 
-    Expected return format:
-    {
-        "store_id": int,
-        "item_id": int,
-        "target_date": "YYYY-MM-DD"
-    }
-
-    Return None if the LLM cannot parse the prompt.
+    Returns:
+        {"store_id": int, "item_id": int, "target_date": str} or None
     """
-    # ── Naive regex fallback (replace with LLM call) ──
+    # ── Try LLM extraction first ──
+    try:
+        last_date = data["date"].max().date()
+        result = parse_forecast_intent(
+            message=prompt,
+            available_stores=list(range(1, 11)),
+            available_items=list(range(1, 51)),
+            last_known_date=last_date,
+        )
+        if result is not None:
+            return result
+    except Exception:
+        pass  # Fall through to regex
+
+    # ── Regex fallback ──
     store_match = re.search(r"[Ss]tore\s*(\d+)", prompt)
     item_match = re.search(r"[Ii]tem\s*(\d+)", prompt)
     date_match = re.search(r"(\d{4}-\d{2}-\d{2})", prompt)
 
-    # Try to also match written-out dates like "February 10 2018"
+    # Try to match written-out dates like "February 10 2018"
     if not date_match:
         month_names = {
             "january": 1, "february": 2, "march": 3, "april": 4,
@@ -585,90 +698,135 @@ def parse_natural_language(prompt: str) -> dict | None:
 
 def generate_ai_insights(store_id, item_id, target_date, prediction, features) -> list[dict]:
     """
-    PLACEHOLDER — replace with your LLM API call.
-
-    This function should return a list of insight dicts:
-    [
-        {
-            "type": "high" | "season" | "trend" | "neutral",
-            "text": "HTML-safe insight string, can use <strong> tags"
-        },
-        ...
-    ]
-
-    The LLM should analyze WHY sales are predicted to be high/low,
-    considering factors like:
-    - Festive seasons / holidays
-    - Weekend vs weekday
-    - Day of week patterns
-    - Recent sales trends (lag features)
-    - Rolling average comparisons
-    - Seasonal patterns (month)
-
-    Return an empty list if no insights are available.
+    Generate AI-powered insights explaining the forecast using Groq LLM API.
+    Falls back to rule-based insights if client is not configured or API fails.
     """
-    # ── Static placeholder insights (replace with LLM output) ──
-    insights = []
-
     is_weekend = int(target_date.weekday() >= 5)
     day_name = target_date.strftime("%A")
     month_name = target_date.strftime("%B")
+    year = target_date.year
 
-    lag_1 = features["lag_1"].values[0]
-    rolling_7 = features["rolling_mean_7"].values[0]
-    rolling_30 = features["rolling_mean_30"].values[0]
+    lag_1 = features["lag_1"].values[0] if "lag_1" in features else 0
+    lag_7 = features["lag_7"].values[0] if "lag_7" in features else 0
+    lag_30 = features["lag_30"].values[0] if "lag_30" in features else 0
+    rolling_7 = features["rolling_mean_7"].values[0] if "rolling_mean_7" in features else 0
+    rolling_30 = features["rolling_mean_30"].values[0] if "rolling_mean_30" in features else 0
 
-    # Weekend insight
-    if is_weekend:
-        insights.append({
-            "type": "high",
-            "text": f"<strong>{day_name}</strong> — weekends typically show different demand patterns. "
-                    f"Consumer foot traffic tends to spike on Saturdays.",
-        })
-    else:
-        insights.append({
-            "type": "neutral",
-            "text": f"<strong>{day_name}</strong> — a regular weekday. Sales usually follow "
-                    f"a steady mid-week baseline for this store.",
-        })
+    # Define helper fallback function (our rule-based logic)
+    def get_fallback_insights():
+        insights = []
+        # Weekend insight
+        if is_weekend:
+            insights.append({
+                "type": "high",
+                "text": f"<strong>{day_name}</strong> — weekends typically show different demand patterns. "
+                        f"Consumer foot traffic tends to spike on Saturdays.",
+            })
+        else:
+            insights.append({
+                "type": "neutral",
+                "text": f"<strong>{day_name}</strong> — a regular weekday. Sales usually follow "
+                        f"a steady mid-week baseline for this store.",
+            })
 
-    # Trend insight
-    if rolling_7 > rolling_30 * 1.1:
-        insights.append({
-            "type": "trend",
-            "text": f"<strong>Upward momentum</strong> — the 7-day average ({rolling_7:.0f}) is "
-                    f"above the 30-day average ({rolling_30:.0f}), suggesting rising demand.",
-        })
-    elif rolling_7 < rolling_30 * 0.9:
-        insights.append({
-            "type": "trend",
-            "text": f"<strong>Cooling demand</strong> — recent 7-day average ({rolling_7:.0f}) has "
-                    f"dipped below the 30-day trend ({rolling_30:.0f}).",
-        })
+        # Trend insight
+        if rolling_7 > rolling_30 * 1.1:
+            insights.append({
+                "type": "trend",
+                "text": f"<strong>Upward momentum</strong> — the 7-day average ({rolling_7:.0f}) is "
+                        f"above the 30-day average ({rolling_30:.0f}), suggesting rising demand.",
+            })
+        elif rolling_7 < rolling_30 * 0.9:
+            insights.append({
+                "type": "trend",
+                "text": f"<strong>Cooling demand</strong> — recent 7-day average ({rolling_7:.0f}) has "
+                        f"dipped below the 30-day trend ({rolling_30:.0f}).",
+            })
 
-    # Seasonal insight
-    if target_date.month in [11, 12]:
-        insights.append({
-            "type": "season",
-            "text": f"<strong>Holiday season ({month_name})</strong> — historically a high-demand "
-                    f"period. Expect elevated sales from festive shopping.",
-        })
-    elif target_date.month in [1, 2]:
-        insights.append({
-            "type": "season",
-            "text": f"<strong>Post-holiday ({month_name})</strong> — demand often normalizes after "
-                    f"the festive spike. Watch for clearance-driven bumps.",
-        })
-    else:
-        insights.append({
-            "type": "season",
-            "text": f"<strong>{month_name}</strong> — a standard seasonal period for this category. "
-                    f"No major holiday effects expected.",
-        })
+        # Seasonal insight
+        if target_date.month in [11, 12]:
+            insights.append({
+                "type": "season",
+                "text": f"<strong>Holiday season ({month_name})</strong> — historically a high-demand "
+                        f"period. Expect elevated sales from festive shopping.",
+            })
+        elif target_date.month in [1, 2]:
+            insights.append({
+                "type": "season",
+                "text": f"<strong>Post-holiday ({month_name})</strong> — demand often normalizes after "
+                        f"the festive spike. Watch for clearance-driven bumps.",
+            })
+        else:
+            insights.append({
+                "type": "season",
+                "text": f"<strong>{month_name}</strong> — a standard seasonal period for this category. "
+                        f"No major holiday effects expected.",
+            })
+        return insights
 
-    return insights
+    if client is None:
+        return get_fallback_insights()
 
+    # Call LLM
+    llm_prompt = f"""
+Analyze the predicted sales of {prediction} units for store {store_id}, item {item_id} on {target_date.strftime('%Y-%m-%d')} ({day_name}, {month_name} {year}).
 
+Here are the details:
+- Lag 1 (sales from yesterday): {lag_1:.0f} units
+- Lag 7 (sales from 7 days ago): {lag_7:.0f} units
+- Lag 30 (sales from 30 days ago): {lag_30:.0f} units
+- 7-day rolling average sales: {rolling_7:.1f} units
+- 30-day rolling average sales: {rolling_30:.1f} units
+- Is weekend: {'Yes' if is_weekend else 'No'}
+
+Determine the main drivers for this forecast. Compare the predicted value ({prediction}) against the rolling averages and lags. Explain why the sales are at this level.
+Provide 2 to 3 distinct bullet points analyzing the prediction.
+
+Return ONLY a valid JSON array of objects. Do not include markdown code blocks, explanation text, or anything else.
+Each object in the array must have exactly these keys:
+- "type": Choose from: "high" (positive drivers/spikes), "season" (calendar/monthly/holiday effects), "trend" (momentum, comparison of 7-day vs 30-day), "neutral" (general notes/baseline).
+- "text": A concise, HTML-safe explanation. You can and should use <strong>...</strong> tags to highlight key phrases (e.g. "<strong>weekend surge</strong>", "<strong>upward momentum</strong>", etc.). Keep explanations short, professional, and specific.
+
+Example JSON output format:
+[
+  {{"type": "high", "text": "<strong>Weekend demand spike</strong> — Saturday foot traffic drives elevated sales."}},
+  {{"type": "trend", "text": "<strong>Rising momentum</strong> — the 7-day average of {rolling_7:.1f} is above the 30-day average."}}
+]
+"""
+
+    try:
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            temperature=0.2,
+            messages=[
+                {"role": "system", "content": "You are a professional retail data analyst. Return JSON arrays only."},
+                {"role": "user", "content": llm_prompt},
+            ],
+        )
+
+        raw = response.choices[0].message.content.strip()
+
+        # Strip accidental code fences
+        if raw.startswith("```"):
+            raw = raw.replace("```json", "").replace("```", "").strip()
+
+        data = json.loads(raw)
+        if isinstance(data, list):
+            # Validate types of insights
+            validated_insights = []
+            for item in data:
+                if isinstance(item, dict) and "type" in item and "text" in item:
+                    # ensure valid type
+                    if item["type"] not in ["high", "season", "trend", "neutral"]:
+                        item["type"] = "neutral"
+                    validated_insights.append(item)
+            if validated_insights:
+                return validated_insights
+    except Exception as e:
+        # If anything fails, fall back to rule-based insights
+        pass
+
+    return get_fallback_insights()
 # ──────────────────────────────────────────────
 # Plotly chart helper
 # ──────────────────────────────────────────────
